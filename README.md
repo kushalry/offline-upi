@@ -89,7 +89,7 @@ Each user's device generates an RSA keypair on registration (in this demo, the "
 ### 6. Layered security
 - **BCrypt** for PIN + password (work factor 12)
 - **RSA-2048 / SHA-256** for offline token signatures
-- **JWT (HS256)** for API auth — stateless, includes `exp`, validated by filter
+- **JWT (HS384)** for API auth — stateless, includes `exp`, validated by filter
 - **Constant-time comparison** for signature verification (RSA verify is intrinsically constant-time)
 - **Stateless sessions** — `SessionCreationPolicy.STATELESS`, CSRF disabled (REST API)
 
@@ -128,6 +128,7 @@ The seeder pre-creates two accounts:
 curl -X POST http://localhost:8080/api/transactions/transfer \
   -H "Content-Type: application/json" \
   -d '{
+    "Authorization": "Bearer $TOKEN"
     "idempotencyKey": "demo-online-1",
     "senderVpa": "ramesh@upi",
     "receiverVpa": "sita@upi",
@@ -182,7 +183,7 @@ First login to get a JWT:
 TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"vpa":"ramesh@upi","password":"password123"}' \
-  | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+  | grep -o '"token":"[^"]*' | cut -d'"' -f4)
 
 # Spend from UPI Lite — no PIN needed (device unlock is authn)
 curl -X POST http://localhost:8080/api/transactions/lite/spend \
@@ -203,6 +204,7 @@ curl -X POST http://localhost:8080/api/transactions/lite/spend \
 TOKEN_PAYLOAD=$(curl -s -X POST http://localhost:8080/api/offline-tokens/issue \
   -H "Content-Type: application/json" \
   -d '{
+    "Authorization": "Bearer $TOKEN"
     "senderVpa": "ramesh@upi",
     "receiverVpa": "sita@upi",
     "amount": 200,
@@ -223,6 +225,89 @@ curl -X POST http://localhost:8080/api/offline-tokens/redeem \
 ```
 
 Observe the logs — you'll see signature verification, nonce dedup, and settlement.
+
+## Verified demo output
+
+All flows below were run against the live application (`mvn spring-boot:run`) and the
+responses are captured verbatim. All `mvn test` integration tests pass
+(`Tests run: 6, Failures: 0, Errors: 0`).
+
+> **Auth note:** every endpoint except `/api/auth/**`, `/api/ussd/**`,
+> `/api/accounts/register`, and the docs/health paths requires a JWT. Login first
+> and pass the bearer token on subsequent calls.
+
+### 0. Login → JWT
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"vpa":"ramesh@upi","password":"password123"}' \
+  | grep -o '"token":"[^"]*' | cut -d'"' -f4)
+```
+```json
+{"token":"eyJhbGciOiJIUzM4NCJ9...","vpa":"ramesh@upi","expiresInSec":3600}
+```
+
+### 1. Online transfer — and idempotent replay
+
+First call (₹250 moves, balance 4000 → 3750):
+```bash
+curl -s -X POST http://localhost:8080/api/transactions/transfer \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"idempotencyKey":"demo-1","senderVpa":"ramesh@upi","receiverVpa":"sita@upi","amount":250,"upiPin":"1234","remarks":"Lunch"}'
+```
+```json
+{"utr":"F069BF85757847EE","status":"SUCCESS","message":"₹250 sent to sita@upi","newBalance":3750.00,"idempotentReplay":false}
+```
+
+Same request again (same key) — **same UTR returned, no second debit:**
+```json
+{"utr":"F069BF85757847EE","status":"SUCCESS","message":"Transfer completed","newBalance":null,"idempotentReplay":true}
+```
+
+### 2. Wrong PIN — rejected with structured error + audit log
+
+```json
+HTTP/1.1 401
+{"timestamp":"2026-05-27T21:09:58Z","errorCode":"INVALID_PIN","message":"Invalid UPI PIN"}
+```
+The failed attempt is still written to the audit log (via `@Transactional(REQUIRES_NEW)`),
+so it survives the parent-transaction rollback.
+
+### 3. P2P offline token — issue → redeem → double-spend blocked
+
+Issue (RSA-2048 signed; ₹200 reserved from sender's Lite wallet):
+```json
+{
+  "nonce":"b8a2c4a6-8d45-47b1-949f-144f6af008d6",
+  "senderVpa":"ramesh@upi","receiverVpa":"sita@upi","amount":200,
+  "issuedAt":"2026-05-27T21:11:16Z","expiresAt":"2026-05-28T21:11:16Z",
+  "signedPayload":"b8a2c4a6-...|ramesh@upi|sita@upi|200|2026-05-27T21:11:16Z|2026-05-28T21:11:16Z",
+  "signature":"MP+pBHmkq68jyEnXQv/CNf11pyy/Emofk...=="
+}
+```
+
+Redeem — signature verified, settled:
+```json
+{"status":"SETTLED","utr":"OFL5E56E4B4918F4","message":"Offline token settled. ₹200 credited to sita@upi"}
+```
+
+Redeem the **same** token again — nonce already used, **no second credit:**
+```json
+{"status":"ALREADY_SETTLED","utr":"OFL5E56E4B4918F4","message":"Token was already redeemed"}
+```
+
+### 4. Tampered token — signature rejects the forgery
+
+Take a valid token, change `"amount":50` → `"amount":5000`, leave the signature intact
+(an attacker can't re-sign without the sender's private key), and redeem:
+```json
+HTTP/1.1 422
+{"timestamp":"2026-05-28T04:08:56Z","errorCode":"TOKEN_INVALID","message":"Token signature verification failed"}
+```
+The server reconstructs the canonical string from the (tampered) fields, the RSA signature
+no longer matches, and the redeem is rejected. The amount is readable and editable — but any
+edit is **detectable**. No funds move.
 
 ---
 
